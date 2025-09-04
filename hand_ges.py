@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 import mediapipe as mp
-
+import time
 # Initialize MediaPipe Hands
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
@@ -80,10 +80,18 @@ try:
                 output = filtered * mask3 + frame * (1 - mask3)
                 output = output.astype(np.uint8)
                 # Show filter name
-                cv2.putText(output, filter_names[current_filter], (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
+                cv2.putText(output, filter_names[current_filter], (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,255), 5)
                 cv2.imshow('Hand Gesture Filter', output)
+                
+                
                 # Change filter if pinch detected
                 if pinch_detected:
+                    # Save the current filtered output with timestamp
+                    
+                    timestamp = int(time.time() * 1000)  # milliseconds for uniqueness
+                    filename = f"aditya_{timestamp}.jpg"
+                    cv2.imwrite(filename, output)
+                    print(f"Image saved: {filename}")
                     current_filter = (current_filter + 1) % len(filters)
                     # Debounce: wait a short moment
                     cv2.waitKey(300)
