@@ -3,11 +3,10 @@ import cv2
 import numpy as np
 import mediapipe as mp
 import time
-import base64 # Added for automatic download functionality
-# Removed: from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
-# Removed: import av
+import base64
 import os 
-# Removed: import threading # We will run the loop directly in the Streamlit thread
+from io import BytesIO
+import zipfile
 
 # Page configuration
 st.set_page_config(
@@ -17,13 +16,13 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for animations and styling (kept for aesthetics)
+# Custom CSS for animations and styling
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
     
     body {
-        font-family: 'Inter', sans-serif';
+        font-family: 'Inter', sans-serif;
     }
 
     @keyframes bounce {
@@ -134,13 +133,34 @@ st.markdown("""
         text-align: center;
     }
     
-    .floating-icon {
-        position: fixed;
-        bottom: 20px;
-        right: 20px;
-        font-size: 3rem;
-        animation: bounce 2s infinite;
-        z-index: 1000;
+    .download-section {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        border-radius: 10px;
+        padding: 15px;
+        margin: 10px 0;
+        color: white;
+    }
+    
+    .stDownloadButton button {
+        width: 100%;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border: none;
+        padding: 10px;
+        border-radius: 5px;
+        cursor: pointer;
+    }
+    
+    .stDownloadButton button:hover {
+        background: linear-gradient(135deg, #764ba2 0%, #667eea 100%);
+    }
+    
+    .capture-item {
+        background: rgba(255, 255, 255, 0.1);
+        border-radius: 8px;
+        padding: 10px;
+        margin: 5px 0;
+        border-left: 4px solid #667eea;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -148,7 +168,6 @@ st.markdown("""
 # Initialize MediaPipe Hands
 @st.cache_resource
 def initialize_mediapipe():
-    # Cache the MediaPipe setup to avoid re-initializing on every frame/rerun
     mp_hands = mp.solutions.hands
     mp_drawing = mp.solutions.drawing_utils
     hands = mp_hands.Hands(
@@ -159,7 +178,7 @@ def initialize_mediapipe():
     )
     return mp_hands, mp_drawing, hands
 
-# --- Filter Functions (Kept as is) ---
+# Filter Functions
 def filter_bw(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
@@ -203,27 +222,42 @@ def filter_emboss(frame):
 def filter_blur(frame):
     return cv2.GaussianBlur(frame, (15, 15), 0)
 
-# Store persistent state for camera logic 
+# Initialize session state
 if 'cam_running' not in st.session_state:
     st.session_state.cam_running = False
 if 'last_pinch_time' not in st.session_state:
     st.session_state.last_pinch_time = 0
 if 'camera_must_rerun' not in st.session_state:
     st.session_state.camera_must_rerun = False
-if 'download_data_uri' not in st.session_state:
-    st.session_state.download_data_uri = None # Stores {filename, uri} for auto-download
+if 'download_triggered' not in st.session_state:
+    st.session_state.download_triggered = False
+if 'current_filter' not in st.session_state:
+    st.session_state.current_filter = 0
+if 'captured_images' not in st.session_state:
+    st.session_state.captured_images = []
+if 'latest_capture' not in st.session_state:
+    st.session_state.latest_capture = None
 
-# The 'captured_images' list now stores dictionaries: [{'filename': str, 'data': bytes}]
+def create_zip_download():
+    """Create a ZIP file containing all captured images"""
+    if not st.session_state.captured_images:
+        return None
+    
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for i, img_data in enumerate(st.session_state.captured_images):
+            zip_file.writestr(img_data['filename'], img_data['data'])
+    
+    zip_buffer.seek(0)
+    return zip_buffer
 
 def process_frame_with_gestures(img, mp_hands, mp_drawing, hands, filters, filter_names):
     """Processes a single frame for hand detection, filter application, and gesture control."""
-    img = cv2.flip(img, 1) # Flip the image for a mirror view
+    img = cv2.flip(img, 1)
     h, w, _ = img.shape
     
-    # Safely get current filter index
     current_filter_index = st.session_state.get('current_filter', 0)
 
-    # Convert BGR to RGB for MediaPipe
     rgb_frame = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     results = hands.process(rgb_frame)
     
@@ -234,8 +268,8 @@ def process_frame_with_gestures(img, mp_hands, mp_drawing, hands, filters, filte
     
     hands_detected = results.multi_hand_landmarks is not None and len(results.multi_hand_landmarks) == 2
 
-    output = img # Start with the original image
-    
+    output = img
+
     if hands_detected:
         for hand_landmarks, hand_info in zip(results.multi_hand_landmarks, results.multi_handedness):
             label = hand_info.classification[0].label
@@ -245,7 +279,6 @@ def process_frame_with_gestures(img, mp_hands, mp_drawing, hands, filters, filte
             x_thumb, y_thumb = int(thumb_tip.x * w), int(thumb_tip.y * h)
             x_index, y_index = int(index_tip.x * w), int(index_tip.y * h)
             
-            # Pinch detection
             pinch_dist = np.hypot(x_thumb - x_index, y_thumb - y_index)
             if pinch_dist < pinch_threshold:
                 pinch_detected = True
@@ -255,10 +288,8 @@ def process_frame_with_gestures(img, mp_hands, mp_drawing, hands, filters, filte
             elif label == 'Right':
                 right_hand_points = [(x_thumb, y_thumb), (x_index, y_index)]
             
-            # Draw hand landmarks
             mp_drawing.draw_landmarks(img, hand_landmarks, mp_hands.HAND_CONNECTIONS)
         
-        # Apply filter only if both hands are detected and points collected
         if left_hand_points and right_hand_points:
             left_thumb, left_index = left_hand_points
             right_thumb, right_index = right_hand_points
@@ -266,69 +297,60 @@ def process_frame_with_gestures(img, mp_hands, mp_drawing, hands, filters, filte
             roi_points = [left_index, right_index, right_thumb, left_thumb]
             pts = np.array(roi_points, np.int32)
             
-            # Draw ROI boundary
             cv2.polylines(img, [pts], isClosed=True, color=(0, 255, 0), thickness=3)
             
-            # Create mask
             mask = np.zeros((h, w), dtype=np.uint8)
             cv2.fillPoly(mask, [pts], 255)
             
-            # Apply current filter
             filtered = filters[current_filter_index](img)
             mask3 = cv2.merge([mask, mask, mask]) // 255
             output = filtered * mask3 + img * (1 - mask3)
             output = output.astype(np.uint8)
             
-            # Show filter name
             cv2.putText(output, f"Filter: {filter_names[current_filter_index]}", 
                         (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 255), 3)
             cv2.putText(output, f"Filter: {filter_names[current_filter_index]}", 
                         (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
             
-            # Pinch indicator and filter change/save logic
             if pinch_detected:
-                
                 current_time = time.time()
-                if current_time - st.session_state.last_pinch_time > 1.0: # 1 second debounce
-                    # Cycle filter index
+                if current_time - st.session_state.last_pinch_time > 1.0:
                     new_filter_index = (current_filter_index + 1) % len(filters)
                     st.session_state.last_pinch_time = current_time
                     st.session_state.current_filter = new_filter_index
                     
-                    # --- AUTO-DOWNLOAD LOGIC ---
-                    
-                    # Encode frame to JPG bytes
-                    success, encoded_image = cv2.imencode('.jpg', output)
+                    # Capture and prepare image for download
+                    success, encoded_image = cv2.imencode('.jpg', output, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     
                     if success:
                         timestamp = int(time.time() * 1000)
-                        filename = f"capture_{timestamp}_{filter_names[new_filter_index].replace(' ', '_').replace('&', 'and')}.jpg"
+                        filename = f"gesture_capture_{timestamp}_{filter_names[new_filter_index].replace(' ', '_').replace('&', 'and')}.jpg"
                         
-                        # Convert bytes to base64 string
-                        base64_data = base64.b64encode(encoded_image.tobytes()).decode('utf-8')
-                        
-                        # Store image data in the persistent log (for sidebar view)
-                        st.session_state.captured_images.append({
+                        # Store the latest capture for download
+                        st.session_state.latest_capture = {
                             'filename': filename,
-                            'data': encoded_image.tobytes() # Keep bytes for st.download_button fallback/log
-                        }) 
-                        
-                        # Store the data URI for immediate, automatic download on the next rerun
-                        st.session_state.download_data_uri = {
-                            'filename': filename,
-                            'uri': f"data:image/jpeg;base64,{base64_data}"
+                            'data': encoded_image.tobytes(),
+                            'filter': filter_names[new_filter_index],
+                            'timestamp': timestamp
                         }
                         
-                        # Signal the main loop to perform cleanup and rerun
-                        st.session_state.camera_must_rerun = True
+                        # Add to captured images log
+                        st.session_state.captured_images.append({
+                            'filename': filename,
+                            'data': encoded_image.tobytes(),
+                            'filter': filter_names[new_filter_index],
+                            'timestamp': timestamp
+                        })
                         
+                        # Trigger download and rerun
+                        st.session_state.download_triggered = True
+                        st.session_state.camera_must_rerun = True
                     else:
                         cv2.putText(output, "CAPTURE FAILED!", (15, 100), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             
             return output
         
-    # If no hands or incomplete detection, return original image with instructions
     cv2.putText(output, "Show both hands for gesture control", 
                 (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     cv2.putText(output, "Pinch thumb & index finger to change filter", 
@@ -336,7 +358,6 @@ def process_frame_with_gestures(img, mp_hands, mp_drawing, hands, filters, filte
     
     return output
 
-# Main app function
 def main():
     # Header with animated icons
     st.markdown("""
@@ -346,16 +367,6 @@ def main():
         <span class="animated-icon">🎨</span>
     </div>
     """, unsafe_allow_html=True)
-
-    # Initialize session state (Check done in global scope for robustness)
-    if 'current_filter' not in st.session_state:
-        st.session_state.current_filter = 0
-    if 'captured_images' not in st.session_state:
-        st.session_state.captured_images = []
-    if 'camera_must_rerun' not in st.session_state:
-        st.session_state.camera_must_rerun = False
-    if 'download_data_uri' not in st.session_state:
-        st.session_state.download_data_uri = None
 
     # Initialize MediaPipe components
     mp_hands, mp_drawing, hands = initialize_mediapipe()
@@ -401,129 +412,210 @@ def main():
         </div>
         """, unsafe_allow_html=True)
         
+        # Download Section
+        st.markdown("""
+        <div class="download-section">
+            <span class="pulse-icon">💾</span>
+            <h4>Download Manager</h4>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Manual download button for latest capture
+        if st.session_state.latest_capture:
+            capture = st.session_state.latest_capture
+            st.download_button(
+                label="📥 Download Latest Capture",
+                data=capture['data'],
+                file_name=capture['filename'],
+                mime="image/jpeg",
+                use_container_width=True,
+                key="download_latest"
+            )
+        
+        # Download all as zip option
+        if len(st.session_state.captured_images) > 0:
+            zip_buffer = create_zip_download()
+            if zip_buffer:
+                st.download_button(
+                    label=f"📦 Download All Images ({len(st.session_state.captured_images)} files)",
+                    data=zip_buffer,
+                    file_name=f"all_gesture_captures_{int(time.time())}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                    key="download_all_zip"
+                )
+            
+            # Individual download buttons for each capture
+            st.markdown("---")
+            st.markdown("### 📁 Individual Downloads")
+            st.markdown(f"**Total captures:** {len(st.session_state.captured_images)}")
+            
+            # Show individual download buttons for recent captures
+            for i, img_data in enumerate(reversed(st.session_state.captured_images[-10:])):  # Last 10 captures
+                with st.container():
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.markdown(f"""
+                        <div class="capture-item">
+                            <strong>{img_data['filename']}</strong><br>
+                            <small>Filter: {img_data['filter']}</small>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with col2:
+                        st.download_button(
+                            label="📥",
+                            data=img_data['data'],
+                            file_name=img_data['filename'],
+                            mime="image/jpeg",
+                            key=f"download_{i}_{img_data['timestamp']}",
+                            use_container_width=True
+                        )
+        
+        st.markdown("---")
+        
         # Instructions
         st.markdown("""
         <div class="info-card">
             <span class="pulse-icon">📋</span>
             <h4>Instructions</h4>
+            <p>1. Show both hands to camera</p>
+            <p>2. Make pinching gesture to change filter</p>
+            <p>3. Images auto-save to your downloads</p>
+            <p>4. Use buttons below to download manually</p>
         </div>
         """, unsafe_allow_html=True)
         
         # Clear button
-        if st.button("🗑️ Clear Image Log", type="secondary"):
+        if st.button("🗑️ Clear Image Log", type="secondary", use_container_width=True):
             st.session_state.captured_images = []
-            st.session_state.last_pinch_time = 0 # Reset timer
-            st.session_state.download_data_uri = None # Clear any pending download
+            st.session_state.latest_capture = None
+            st.session_state.last_pinch_time = 0
+            st.session_state.download_triggered = False
             st.rerun()
-            
-        # --- Capture Log ---
-        if st.session_state.captured_images:
-            st.markdown("---")
-            st.markdown("### Capture Log")
-            for item in st.session_state.captured_images[-3:]:
-                st.markdown(f"📄 `{item['filename']}`")
-        
-    # --- AUTOMATIC DOWNLOAD TRIGGER BLOCK ---
-    if st.session_state.download_data_uri:
-        download_info = st.session_state.download_data_uri
-        
-        # 1. Render a hidden anchor tag with data URI
-        download_html = f"""
-        <a href="{download_info['uri']}" download="{download_info['filename']}" id="auto-download-link" style="display: none;"></a>
-        
-        <!-- 2. Use JavaScript to immediately 'click' the link -->
-        <script>
-            document.getElementById('auto-download-link').click();
-        </script>
-        """
-        st.markdown(download_html, unsafe_allow_html=True)
-        
-        # 3. Show confirmation and clear flag for next capture
-        st.success(f"🎉 **AUTO-DOWNLOADED**: '{download_info['filename']}'")
-        st.session_state.download_data_uri = None
 
-
-    # Main content
-    st.markdown("### 📹 Live Camera Feed (OpenCV Capture)")
+    # Main content area
+    col1, col2 = st.columns([2, 1])
     
-    # Camera Start/Stop Control
-    if st.session_state.cam_running:
-        stop_button = st.button("🛑 STOP Camera", type="secondary")
-        if stop_button:
-            st.session_state.cam_running = False
-            st.rerun() # Rerun to exit the loop
-    else:
-        start_button = st.button("▶️ START Camera", type="primary")
-        if start_button:
-            st.session_state.cam_running = True
-            st.rerun() # Rerun to enter the loop
-    
-    
-    video_placeholder = st.empty()
-    
-    if st.session_state.cam_running:
-        # Use 0 for default camera
-        cap = cv2.VideoCapture(0) 
+    with col1:
+        st.markdown("### 📹 Live Camera Feed")
         
-        if not cap.isOpened():
-            st.error("🚨 Error: Could not open camera. Ensure your camera is connected and available to OpenCV (index 0).")
-            st.session_state.cam_running = False
+        # Camera Control
+        control_col1, control_col2 = st.columns([1, 2])
+        with control_col1:
+            if st.session_state.cam_running:
+                if st.button("🛑 STOP Camera", type="secondary", use_container_width=True):
+                    st.session_state.cam_running = False
+                    st.rerun()
+            else:
+                if st.button("▶️ START Camera", type="primary", use_container_width=True):
+                    st.session_state.cam_running = True
+                    st.rerun()
+        
+        video_placeholder = st.empty()
+        
+        if st.session_state.cam_running:
+            cap = cv2.VideoCapture(0)
             
+            if not cap.isOpened():
+                st.error("🚨 Error: Could not open camera. Ensure your camera is connected and available.")
+                st.session_state.cam_running = False
+            else:
+                # Set camera resolution for better performance
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                
+                st.markdown("""
+                <div class="success-card">
+                    <span class="pulse-icon">📹</span> 
+                    Camera active - Show both hands for gesture control
+                </div>
+                """, unsafe_allow_html=True)
+
+                while st.session_state.cam_running:
+                    ret, frame = cap.read()
+                    
+                    if not ret:
+                        st.warning("⚠️ Cannot read frame from camera. Stopping feed.")
+                        st.session_state.cam_running = False
+                        break
+                    
+                    processed_frame = process_frame_with_gestures(
+                        frame, mp_hands, mp_drawing, hands, filters, filter_names
+                    )
+                    
+                    rgb_frame = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+                    video_placeholder.image(rgb_frame, channels="RGB", use_container_width=True)
+                    
+                    if st.session_state.camera_must_rerun:
+                        st.session_state.camera_must_rerun = False
+                        cap.release()
+                        st.rerun()
+                        break
+                    
+                    time.sleep(0.03)
+
+                cap.release()
+                st.session_state.cam_running = False
+                st.rerun()
+                
         else:
+            video_placeholder.info("👆 Click 'START Camera' to begin hand gesture control")
             st.markdown("""
-            <div class="success-card">
-                <span class="rotate-icon">📹</span> 
-                Camera is LIVE! Show your hands for gesture control
+            <div class="info-card">
+                <h4>💡 Pro Tip</h4>
+                <p>Make sure to allow camera permissions in your browser when prompted.</p>
+                <p>The download will automatically start when you change filters using hand gestures.</p>
             </div>
             """, unsafe_allow_html=True)
-
-            while st.session_state.cam_running:
-                ret, frame = cap.read()
-                
-                if not ret:
-                    st.warning("⚠️ Cannot read frame from camera. Stopping feed.")
-                    st.session_state.cam_running = False
-                    break
-                
-                # Process the frame
-                processed_frame = process_frame_with_gestures(
-                    frame, mp_hands, mp_drawing, hands, filters, filter_names
-                )
-                
-                # Display the processed frame (BGR to RGB conversion for Streamlit)
-                rgb_frame = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
-                video_placeholder.image(rgb_frame, channels="RGB", use_container_width=True)
-                
-                # --- RERUN LOGIC: Check for RERUN signal from pinch gesture ---
-                if st.session_state.camera_must_rerun:
-                    st.session_state.camera_must_rerun = False # Reset flag
-                    cap.release() # CRITICAL: Release the camera resource immediately
-                    st.rerun() # Stop current script and restart cleanly
-                    break # Exit the while loop
-                # -----------------------------------------------------------
-                
-                # Important: Use a small sleep to prevent the loop from consuming 100% CPU
-                # and allow the app to be responsive to the STOP button.
-                time.sleep(0.01)
-
-            cap.release()
-            st.session_state.cam_running = False # Ensure flag is set to False after loop exits
-            st.rerun() 
+    
+    with col2:
+        st.markdown("### 💾 Download Area")
+        
+        if st.session_state.latest_capture:
+            latest = st.session_state.latest_capture
+            st.markdown(f"""
+            <div class="success-card">
+                <span class="pulse-icon">✅</span>
+                <h4>Latest Capture Ready!</h4>
+                <p><strong>Filter:</strong> {latest['filter']}</p>
+                <p><strong>Time:</strong> {time.strftime('%H:%M:%S', time.localtime(latest['timestamp']/1000))}</p>
+                <p><strong>Total Captures:</strong> {len(st.session_state.captured_images)}</p>
+            </div>
+            """, unsafe_allow_html=True)
             
-    else:
-        # Display a placeholder when stopped
-        video_placeholder.image(np.zeros((480, 640, 3), dtype=np.uint8), 
-                                 caption="Camera Feed Stopped", 
-                                 use_container_width=True) 
-
-    # Removed the entire col2 content block
-    # 
-    # Floating effect
-    st.markdown("""
-    <div class="floating-icon">
-        ✨
-    </div>
-    """, unsafe_allow_html=True)
+            # Display the captured image
+            st.image(latest['data'], caption=f"Latest: {latest['filter']}", use_container_width=True)
+            
+            # Auto-download using JavaScript (more reliable)
+            if st.session_state.download_triggered:
+                # Create download link
+                b64_data = base64.b64encode(latest['data']).decode()
+                href = f'<a href="data:image/jpeg;base64,{b64_data}" download="{latest["filename"]}" id="auto-download"></a>'
+                js = """
+                <script>
+                    var link = document.getElementById('auto-download');
+                    if (link) {
+                        link.click();
+                        // Remove the link after click
+                        setTimeout(function() {
+                            link.remove();
+                        }, 100);
+                    }
+                </script>
+                """
+                st.markdown(href + js, unsafe_allow_html=True)
+                st.session_state.download_triggered = False
+                st.success(f"✅ Download started: {latest['filename']}")
+        
+        else:
+            st.markdown("""
+            <div class="info-card">
+                <span class="pulse-icon">📸</span>
+                <h4>No Captures Yet</h4>
+                <p>Start the camera and use hand gestures to capture images!</p>
+                <p>Images will appear here and download automatically.</p>
+            </div>
+            """, unsafe_allow_html=True)
 
     # Footer
     st.markdown("---")
